@@ -1,0 +1,167 @@
+"""
+DIY Hearing Aid - Smartphone/Laptop Based Prototype
+
+WHAT THIS DOES:
+  Real-time audio pipeline: mic -> multi-band EQ (matched to your own audiogram)
+  -> compressor/limiter (FOR SAFETY) -> headphone output.
+
+SAFETY NOTES:
+  - This is a HOBBY ASSISTIVE LISTENING DEVICE, not a medical-grade hearing aid.
+  - The limiter ceiling (MAX_OUTPUT_DB) exists to prevent the device from ever
+    blasting loud sounds into your ear at the same gain as quiet ones. Do not
+    disable it or set it unrealistically high.
+  - Start every session at LOW volume. Increase gradually. If anything is
+    uncomfortably loud, stop immediately; that means a setting is wrong.
+  - Use WIRED headphones/earbuds, not Bluetooth (because latency).
+  - If you have access to an audiologist, get your curve sanity-checked.
+
+REQUIREMENTS:
+  pip install sounddevice scipy numpy --break-system-packages
+  (On some systems, you might also need: pip install pyaudio --break-system-packages)
+
+HOW TO RUN:
+  1. Edit AUDIOGRAM below with your actual thresholds (dB HL) per frequency.
+  2. Plug in wired headphones + a mic (built-in laptop mic is fine to start).
+  3. Run: python hearing_aid.py
+  4. Press Ctrl+C to stop.
+"""
+
+import numpy as np
+import sounddevice as sd
+from scipy.signal import butter, sosfilt, sosfilt_zi
+
+
+# 1. YOUR AUDIOGRAM, EDIT THIS WITH YOUR REAL VALUES FROM AN AUDIOGRAM
+
+AUDIOGRAM = {
+    250:  15,
+    500:  20,
+    1000: 25,
+    2000: 35,
+    4000: 55,
+    8000: 65,
+}
+
+
+# 2. GAIN CALCULATION (half-gain rule, conservative at high loss)
+def compute_gain_curve(audiogram):
+    gains = {}
+    for freq, threshold_db in audiogram.items():
+        if threshold_db <= 40:
+            ratio = 0.5
+        elif threshold_db <= 60:
+            ratio = 0.45
+        else:
+            ratio = 0.35
+        gains[freq] = threshold_db * ratio
+    return gains
+
+GAIN_CURVE = compute_gain_curve(AUDIOGRAM)
+print("Computed gain curve (dB boost per band):")
+for f, g in GAIN_CURVE.items():
+    print(f"  {f:5d} Hz -> +{g:.1f} dB")
+
+
+# 3. AUDIO / FILTER CONFIG
+SAMPLE_RATE = 22050
+BLOCK_SIZE = 1024
+CHANNELS = 1
+
+# EXPLICIT DEVICE SELECTION -- avoids defaulting to Bluetooth (AirPods etc.)
+# Run `print(sd.query_devices())` to see indices for your setup.
+INPUT_DEVICE = 3   # MacBook Air Microphone (change to your wired mic if you have one)
+OUTPUT_DEVICE = 4  # MacBook Air Speakers (change to wired headphones if you have them)
+sd.default.device = (INPUT_DEVICE, OUTPUT_DEVICE)
+
+BAND_EDGES = [0, 375, 750, 1500, 3000, 6000, SAMPLE_RATE / 2 - 1]
+BAND_FREQS = [250, 500, 1000, 2000, 4000, 8000]
+
+MAX_OUTPUT_GAIN_DB = 12
+COMPRESSOR_THRESHOLD = 0.3
+COMPRESSOR_RATIO = 4.0
+
+
+# 4. BUILD FILTER BANK
+def build_filterbank():
+    sos_filters = []
+    nyq = SAMPLE_RATE / 2
+    for i in range(len(BAND_FREQS)):
+        low = BAND_EDGES[i] if BAND_EDGES[i] > 0 else 1
+        high = BAND_EDGES[i + 1]
+        low_norm = low / nyq
+        high_norm = min(high / nyq, 0.999)
+        sos = butter(4, [low_norm, high_norm], btype='band', output='sos')
+        sos_filters.append(sos)
+    return sos_filters
+
+FILTERBANK = build_filterbank()
+FILTER_STATES = [sosfilt_zi(sos) for sos in FILTERBANK]
+
+LINEAR_GAINS = [10 ** (GAIN_CURVE[f] / 20) for f in BAND_FREQS]
+MAX_LINEAR_GAIN = 10 ** (MAX_OUTPUT_GAIN_DB / 20)
+
+# 5. COMPRESSOR / LIMITER
+def compress(signal, threshold=COMPRESSOR_THRESHOLD, ratio=COMPRESSOR_RATIO):
+    out = np.copy(signal)
+    abs_sig = np.abs(signal)
+    over = abs_sig > threshold
+    if np.any(over):
+        excess = abs_sig[over] - threshold
+        compressed_excess = excess / ratio
+        new_mag = threshold + compressed_excess
+        out[over] = np.sign(signal[over]) * new_mag
+    return out
+
+def hard_limit(signal, ceiling=0.95):
+    return np.clip(signal, -ceiling, ceiling)
+
+# 6. REAL-TIME AUDIO CALLBACK
+def audio_callback(indata, outdata, frames, time_info, status):
+    if status:
+        print(status)
+
+    mono_in = indata[:, 0]
+    band_sum = np.zeros_like(mono_in)
+
+    for i, sos in enumerate(FILTERBANK):
+        filtered, FILTER_STATES[i] = sosfilt(sos, mono_in, zi=FILTER_STATES[i])
+        gain = min(LINEAR_GAINS[i], MAX_LINEAR_GAIN)
+        band_sum += filtered * gain
+
+    compressed = compress(band_sum)
+    safe_output = hard_limit(compressed)
+
+    outdata[:, 0] = safe_output
+
+# 7. MAIN
+def main():
+    print("\n--- DIY Hearing Aid Prototype ---")
+    print("Sample rate:", SAMPLE_RATE, "Block size:", BLOCK_SIZE)
+    print("MAX OUTPUT GAIN CEILING:", MAX_OUTPUT_GAIN_DB, "dB")
+    print("\nIMPORTANT: Start your system volume LOW. Increase gradually.")
+    print("Press Ctrl+C to stop.\n")
+
+    devices = sd.query_devices()
+    print("Available audio devices:")
+    print(devices)
+    print()
+
+    try:
+        with sd.Stream(samplerate=SAMPLE_RATE,
+                        blocksize=BLOCK_SIZE,
+                        channels=CHANNELS,
+                        dtype='float32',
+                        callback=audio_callback):
+            print("Running... (Ctrl+C to stop)")
+            while True:
+                sd.sleep(1000)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    except Exception as e:
+        print(f"\nError: {e}")
+        print("Common fixes:")
+        print("  - No mic/speaker detected: check `sd.query_devices()` output above")
+        print("  - Permission denied: grant mic access to your terminal/Python in OS settings")
+
+if __name__ == "__main__":
+    main()
